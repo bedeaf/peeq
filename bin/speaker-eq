@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""T14 speaker EQ with event-driven headphone/USB/Bluetooth routing."""
+import fcntl
+import json
+import os
+from pathlib import Path
+import select
+import signal
+import subprocess
+import sys
+import time
+
+BASE = Path.home() / '.config/speaker-eq'
+PROFILE = json.loads((BASE / 'profile.json').read_text())
+CONFIG = Path.home() / '.config/pulse/default.pa'
+STATE = Path.home() / '.local/state/speaker-eq'
+BEGIN = '# BEGIN T14 SPEAKER EQ\n'
+END = '# END T14 SPEAKER EQ\n'
+ENV = dict(os.environ, LC_ALL='C.UTF-8')
+NAMES = (PROFILE['limiter_sink'], PROFILE['tone_sink'], PROFILE['eq_sink'])
+
+
+def pactl(*args):
+    return subprocess.run(['pactl', *map(str, args)], text=True, env=ENV,
+                          capture_output=True, timeout=8, check=True).stdout.strip()
+
+
+def listing(kind):
+    return json.loads(pactl('-f', 'json', 'list', kind))
+
+
+def atomic_json(path, value):
+    temp = path.with_suffix('.tmp')
+    temp.write_text(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
+    temp.chmod(0o600)
+    temp.replace(path)
+
+
+def enabled():
+    try:
+        return json.loads((BASE / 'settings.json').read_text()).get('enabled', True)
+    except FileNotFoundError:
+        return True
+
+
+def choose_route(sinks, default, use_eq):
+    """Use actual jack availability; an active port can lag a hotplug event."""
+    by_name = {s['name']: s for s in sinks}
+    master = by_name.get(PROFILE['master'])
+    # Respect an external output chosen by PulseAudio or the user, including HDMI.
+    external = by_name.get(default)
+    if external and default not in (*NAMES, PROFILE['master']):
+        port = next((p for p in external.get('ports', [])
+                     if p['name'] == external.get('active_port')), None)
+        if port is None or port.get('availability') != 'not available':
+            return default, None, 'external'
+    if master is None:
+        # A disappearing card must not strand speaker DSP on a rescued stream.
+        candidates = [s for s in sinks if s['name'] not in NAMES
+                      and s.get('properties', {}).get('device.class') != 'filter'
+                      and (not s.get('ports') or any(p.get('availability') != 'not available'
+                                                    for p in s['ports']))]
+        candidates.sort(key=lambda s: s.get('properties', {}).get('device.form_factor')
+                        not in ('headphone', 'headset'))
+        if candidates:
+            return candidates[0]['name'], None, 'external'
+        return None, None, 'unavailable'
+    headphones = next((p for p in master.get('ports', [])
+                       if p.get('type', '').lower() in ('headphones', 'headset')), None)
+    speaker = next((p for p in master.get('ports', [])
+                    if p.get('type', '').lower() == 'speaker'), None)
+    if headphones:
+        available = headphones.get('availability')
+        if available == 'available' or (available != 'not available'
+                                       and master.get('active_port') == headphones['name']):
+            return master['name'], headphones['name'], 'headphones'
+    if speaker:
+        return (PROFILE['eq_sink'] if use_eq else master['name'], speaker['name'],
+                'speaker' if use_eq else 'bypass')
+    # Unknown ports must never receive a speaker-specific correction.
+    return master['name'], None, 'bypass'
+
+
+def module_args():
+    lib = Path.home() / '.local/lib/ladspa'
+    common = f'format=float32le rate={PROFILE["rate"]} channels=2 channel_map=front-left,front-right'
+    return [
+        f'sink_name={PROFILE["limiter_sink"]} master={PROFILE["master"]} '
+        f'plugin={lib}/fast_lookahead_limiter_1913.so label=fastLookaheadLimiter '
+        f'control={",".join(map(str, PROFILE["limiter_controls"]))} {common} '
+        "sink_properties=\"device.description='T14 - Peak Guard'\"",
+        f'sink_name={PROFILE["tone_sink"]} master={PROFILE["limiter_sink"]} '
+        f'plugin={lib}/triple_para_1204.so label=triplePara '
+        f'control={",".join(map(str, PROFILE["eq_controls"]))} {common} '
+        "sink_properties=\"device.description='T14 - Tone EQ'\"",
+        f'sink_name={PROFILE["eq_sink"]} master={PROFILE["tone_sink"]} '
+        f'plugin={lib}/amp_1181.so label=amp '
+        f'control={",".join(map(str, PROFILE["preamp_controls"]))} {common} '
+        "sink_properties=\"device.description='T14 - Natural Speaker EQ'\"",
+    ]
+
+
+def persist(use_eq):
+    # The watcher owns module lifetime. No unconditional speaker EQ at boot.
+    text = CONFIG.read_text() if CONFIG.exists() else '.include /etc/pulse/default.pa\n'
+    if BEGIN in text:
+        before, rest = text.split(BEGIN, 1)
+        _, after = rest.split(END, 1)
+        text = before + after
+        temp = CONFIG.with_suffix('.t14-tmp')
+        temp.write_text(text)
+        temp.chmod(0o600)
+        temp.replace(CONFIG)
+    atomic_json(BASE / 'settings.json', {'enabled': use_eq})
+
+
+def move_streams(source_ids, destination, module_ids):
+    for stream in listing('sink-inputs'):
+        if (stream['sink'] not in source_ids
+                or str(stream.get('owner_module')) in module_ids
+                or stream.get('properties', {}).get('media.role') == 'filter'):
+            continue
+        try:
+            pactl('move-sink-input', stream['index'], destination)
+        except subprocess.CalledProcessError:
+            if any(s['index'] == stream['index'] for s in listing('sink-inputs')):
+                raise
+
+
+def remove_chain(sinks):
+    for name in reversed(NAMES):
+        if name in sinks:
+            pactl('unload-module', sinks[name]['owner_module'])
+
+
+def repair_chain(sinks):
+    """Validate real signal links; a filter name alone does not prove its route."""
+    inputs = listing('sink-inputs')
+    for name, parent in zip(NAMES, (PROFILE['master'], *NAMES[:-1])):
+        links = [s for s in inputs
+                 if str(s.get('owner_module')) == str(sinks[name]['owner_module'])]
+        if len(links) != 1:
+            raise ValueError(f'Unexpected filter connection: {name}')
+        if links[0]['sink'] != sinks[parent]['index']:
+            pactl('move-sink-input', links[0]['index'], parent)
+
+
+def reconcile(previous=None):
+    """Serialized transaction, with rollback of newly created filter modules."""
+    STATE.mkdir(parents=True, exist_ok=True)
+    with (STATE / 'operation.lock').open('w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        sinks = {s['name']: s for s in listing('sinks')}
+        default = pactl('get-default-sink')
+        target, port, mode = choose_route(list(sinks.values()), default, enabled())
+        if target is None:
+            remove_chain(sinks)
+            return None
+        master = sinks.get(PROFILE['master'])
+        created = []
+        try:
+            if port and master.get('active_port') != port:
+                pactl('set-sink-port', master['name'], port)
+            if mode == 'speaker':
+                for name, args in zip(NAMES, module_args()):
+                    if name not in sinks:
+                        created.append(pactl('load-module', 'module-ladspa-sink', args))
+                if created:
+                    sinks = {s['name']: s for s in listing('sinks')}
+                repair_chain(sinks)
+            if default != target:
+                pactl('set-default-sink', target)
+            sources = {s['index'] for n, s in sinks.items()
+                       if n in (*NAMES, PROFILE['master'], previous) and n != target}
+            modules = {str(sinks[n]['owner_module']) for n in NAMES if n in sinks}
+            move_streams(sources, target, modules)
+            if mode != 'speaker':
+                remove_chain(sinks)
+        except Exception:
+            # Keep audible, direct output if a plugin cannot be loaded.
+            if created:
+                fallback = PROFILE['master'] if master else default
+                try:
+                    pactl('set-default-sink', fallback)
+                    latest = {s['name']: s for s in listing('sinks')}
+                    owned = {s['index'] for n, s in latest.items() if n in NAMES}
+                    move_streams(owned, fallback, set(created))
+                finally:
+                    for module in reversed(created):
+                        try:
+                            pactl('unload-module', module)
+                        except subprocess.CalledProcessError:
+                            pass
+            raise
+        status = {'mode': mode, 'output': target, 'port': port, 'enabled': enabled()}
+        status_path = STATE / 'status.json'
+        old = json.loads(status_path.read_text()) if status_path.exists() else {}
+        if any(old.get(k) != v for k, v in status.items()):
+            status['changed_at'] = time.strftime('%Y-%m-%dT%H:%M:%S%z')
+            atomic_json(status_path, status)
+            print(f'{time.strftime("%H:%M:%S")} {mode}: {target}', flush=True)
+        return target
+
+
+def watcher_running():
+    STATE.mkdir(parents=True, exist_ok=True)
+    with (STATE / 'watch.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return False
+        except BlockingIOError:
+            return True
+
+
+def start_watcher():
+    if not watcher_running():
+        with (STATE / 'watch.log').open('a') as log:
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'watch'],
+                             stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                             start_new_session=True, close_fds=True, env=ENV)
+
+
+def watch():
+    # Run subprocess cleanup on logout/restart as well as ordinary exceptions.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    STATE.mkdir(parents=True, exist_ok=True)
+    with (STATE / 'watch.lock').open('w') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        previous = None
+        while True:
+            subscriber = None
+            try:
+                subscriber = subprocess.Popen(['pactl', 'subscribe'], env=ENV,
+                                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                os.set_blocking(subscriber.stdout.fileno(), False)
+                previous = reconcile(previous)
+                deadline = time.monotonic() + 5
+                while subscriber.poll() is None:
+                    timeout = max(0, deadline - time.monotonic())
+                    readable, _, _ = select.select([subscriber.stdout], [], [], timeout)
+                    if readable:
+                        data = os.read(subscriber.stdout.fileno(), 65536)
+                        if not data:
+                            break
+                        if any(kind in data for kind in (b'sink', b'card', b'server')):
+                            deadline = min(deadline, time.monotonic() + 0.12)
+                    if time.monotonic() >= deadline:
+                        previous = reconcile(previous)
+                        deadline = time.monotonic() + 5
+            except (subprocess.SubprocessError, OSError, ValueError) as error:
+                print(f'{time.strftime("%H:%M:%S")} reconnect: {error}', flush=True)
+            finally:
+                if subscriber is not None:
+                    subscriber.terminate()
+                    try:
+                        subscriber.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        subscriber.kill()
+                        subscriber.wait()
+            time.sleep(2)
+
+
+def main():
+    action = sys.argv[1] if len(sys.argv) == 2 else 'status'
+    if action not in ('on', 'auto', 'off', 'status', 'watch', 'once'):
+        raise SystemExit('Usage: speaker-eq auto | on | off | status')
+    if action == 'watch':
+        watch()
+        return
+    if action == 'status':
+        sinks = listing('sinks')
+        default = pactl('get-default-sink')
+        target, port, mode = choose_route(sinks, default, enabled())
+        labels = {'speaker': 'Speaker EQ', 'headphones': 'Headphones — direct',
+                  'external': 'External output — own profile', 'bypass': 'Direct output',
+                  'unavailable': 'Built-in output unavailable'}
+        print('Automatic EQ: ' + ('ON' if enabled() else 'OFF'))
+        print('Watcher: ' + ('RUNNING' if watcher_running() else 'STOPPED'))
+        print('Route: ' + labels[mode])
+        print('Default output: ' + default)
+        if target != default:
+            print('Expected output: ' + str(target))
+        print(pactl('get-sink-volume', default))
+        return
+    if action != 'once':
+        with (STATE / 'operation.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            persist(action != 'off')
+    reconcile()
+    if action in ('on', 'auto', 'off'):
+        start_watcher()
+    if action != 'once':
+        print('Automatic EQ enabled; headphones use a separate, direct audio route.' if action != 'off'
+              else 'EQ disabled; using direct audio output.')
+
+
+if __name__ == '__main__':
+    STATE.mkdir(parents=True, exist_ok=True)
+    try:
+        main()
+    except (subprocess.SubprocessError, OSError, ValueError) as error:
+        print(f'Audio operation failed: {error}', file=sys.stderr)
+        if getattr(error, 'stderr', None):
+            print(error.stderr, file=sys.stderr)
+        sys.exit(1)

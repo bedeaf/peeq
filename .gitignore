@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.log
+*.so
+.env*
+settings.json
+state/
+cookie
+*.tdb
